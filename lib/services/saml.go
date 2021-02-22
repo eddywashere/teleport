@@ -162,9 +162,18 @@ func GetSAMLServiceProvider(sc SAMLConnector, clock clockwork.Clock) (*saml2.SAM
 		return nil, trace.BadParameter("no identity provider certificate provided, either set certificate as a parameter or via entity_descriptor")
 	}
 
-	keyStore, err := utils.ParseSigningKeyStorePEM(sc.GetSigningKeyPair().PrivateKey, sc.GetSigningKeyPair().Cert)
+	signingKeyStore, err := utils.ParseSigningKeyStorePEM(sc.GetSigningKeyPair().PrivateKey, sc.GetSigningKeyPair().Cert)
 	if err != nil {
 		return nil, trace.Wrap(err)
+	}
+
+	encryptionKeyStore := signingKeyStore
+	EncryptionKeyPair := sc.GetEncryptionKeyPair()
+	if EncryptionKeyPair != nil {
+		encryptionKeyStore, err = utils.ParseSigningKeyStorePEM(EncryptionKeyPair.PrivateKey, EncryptionKeyPair.Cert)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	sp := &saml2.SAMLServiceProvider{
@@ -176,7 +185,8 @@ func GetSAMLServiceProvider(sc SAMLConnector, clock clockwork.Clock) (*saml2.SAM
 		SignAuthnRequestsCanonicalizer: dsig.MakeC14N11Canonicalizer(),
 		AudienceURI:                    sc.GetAudience(),
 		IDPCertificateStore:            &certStore,
-		SPKeyStore:                     keyStore,
+		SPKeyStore:                     encryptionKeyStore,
+		SPSigningKeyStore:              signingKeyStore,
 		Clock:                          dsig.NewFakeClock(clock),
 		NameIdFormat:                   "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
 	}

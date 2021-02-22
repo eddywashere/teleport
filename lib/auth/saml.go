@@ -1,5 +1,5 @@
 /*
-Copyright 2019 Gravitational, Inc.
+Copyright 2019-2021 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"io/ioutil"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/beevik/etree"
 	"github.com/gravitational/trace"
 	saml2 "github.com/russellhaering/gosaml2"
+	saml2types "github.com/russellhaering/gosaml2/types"
 )
 
 // UpsertSAMLConnector creates or updates a SAML connector.
@@ -347,17 +349,25 @@ func (a *Server) validateSAMLResponse(samlResponse string) (*samlAuthResponse, e
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	assertionInfo, err := provider.RetrieveAssertionInfo(samlResponse)
+	response, err := provider.ValidateEncodedResponse(samlResponse)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	assertionInfo, err := RetrieveAssertionInfo(provider, connector, response)
 	if err != nil {
 		return nil, trace.AccessDenied(
 			"received response with incorrect or missing attribute statements, please check the identity provider configuration to make sure that mappings for claims/attribute statements are set up correctly. <See: https://goteleport.com/teleport/docs/enterprise/sso/ssh-sso/>, failed to retrieve SAML assertion info from response: %v.", err)
 	}
-
-	if assertionInfo.WarningInfo.InvalidTime {
-		return nil, trace.AccessDenied("invalid time in SAML assertion info")
+	warningInfo, err := provider.VerifyAssertionConditions(&assertionInfo.Assertions[0])
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 
-	if assertionInfo.WarningInfo.NotInAudience {
+	if warningInfo.InvalidTime {
+		return nil, trace.AccessDenied("invalid time in SAML assertion info, possible clock drift")
+	}
+
+	if warningInfo.NotInAudience {
 		return nil, trace.AccessDenied("no audience in SAML assertion info")
 	}
 
@@ -374,7 +384,7 @@ func (a *Server) validateSAMLResponse(samlResponse string) (*samlAuthResponse, e
 		re.attributeStatements[key] = vals
 	}
 
-	log.Debugf("SAML assertion warnings: %+v.", assertionInfo.WarningInfo)
+	log.Debugf("SAML assertion warnings: %+v.", warningInfo)
 
 	if len(connector.GetAttributesToRoles()) == 0 {
 		return re, trace.BadParameter("no attributes to roles mapping, check connector documentation")
@@ -442,4 +452,94 @@ func (a *Server) validateSAMLResponse(samlResponse string) (*samlAuthResponse, e
 	}
 
 	return re, nil
+}
+
+func getDecryptionCert(connector services.SAMLConnector) (*tls.Certificate, error) {
+	keypair := connector.GetEncryptionKeyPair()
+	if keypair == nil {
+		return nil, trace.Errorf("no encryption keypair configured in SAML connector")
+	}
+
+	decryptCert, err := tls.X509KeyPair([]byte(keypair.Cert), []byte(keypair.PrivateKey))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &decryptCert, nil
+}
+
+// RetrieveAssertionInfo retrieves commonly needed information from a SAML response but also explicitly decrypts SAML assertions.
+// This does not populate `WarningInfo`.
+func RetrieveAssertionInfo(provider *saml2.SAMLServiceProvider, connector services.SAMLConnector, response *saml2types.Response) (*saml2.AssertionInfo, error) {
+	assertionInfo := &saml2.AssertionInfo{
+		Values: make(saml2.Values),
+	}
+
+	var decryptCert *tls.Certificate
+	var err error
+
+	if len(response.EncryptedAssertions) > 0 {
+		decryptCert, err = getDecryptionCert(connector)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	for _, encryptedAssertion := range response.EncryptedAssertions {
+		assertion, err := encryptedAssertion.Decrypt(decryptCert)
+		if err != nil {
+			return nil, trace.WrapWithMessage(err, "failed to decrypt SAML assertion")
+		}
+
+		response.Assertions = append(response.Assertions, *assertion)
+	}
+
+	if err := provider.Validate(response); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if len(response.Assertions) == 0 {
+		return nil, trace.Wrap(saml2.ErrMissingAssertion)
+	}
+
+	assertion := &response.Assertions[0]
+	assertionInfo.Assertions = response.Assertions
+	assertionInfo.ResponseSignatureValidated = response.SignatureValidated
+
+	subject := assertion.Subject
+	if subject == nil {
+		return nil, trace.Wrap(saml2.ErrMissingElement{Tag: saml2.SubjectTag})
+	}
+
+	nameID := subject.NameID
+	if nameID == nil {
+		return nil, trace.Wrap(saml2.ErrMissingElement{Tag: saml2.NameIdTag})
+	}
+
+	assertionInfo.NameID = nameID.Value
+
+	// Get the actual assertion attributes
+	attributeStatement := assertion.AttributeStatement
+	if attributeStatement == nil && !provider.AllowMissingAttributes {
+		return nil, trace.Wrap(saml2.ErrMissingElement{Tag: saml2.AttributeStatementTag})
+	}
+
+	if attributeStatement != nil {
+		for _, attribute := range attributeStatement.Attributes {
+			assertionInfo.Values[attribute.Name] = attribute
+		}
+	}
+
+	if assertion.AuthnStatement != nil {
+		if assertion.AuthnStatement.AuthnInstant != nil {
+			assertionInfo.AuthnInstant = assertion.AuthnStatement.AuthnInstant
+		}
+		if assertion.AuthnStatement.SessionNotOnOrAfter != nil {
+			assertionInfo.SessionNotOnOrAfter = assertion.AuthnStatement.SessionNotOnOrAfter
+		}
+
+		assertionInfo.SessionIndex = assertion.AuthnStatement.SessionIndex
+	}
+
+	return assertionInfo, nil
 }

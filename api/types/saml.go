@@ -87,6 +87,10 @@ type SAMLConnector interface {
 	GetProvider() string
 	// SetProvider sets the identity provider.
 	SetProvider(string)
+	// GetEncryptionKeyPair returns the key pair for SAML assertions.
+	GetEncryptionKeyPair() *EncryptionKeyPair
+	// SetEncryptionKeyPair sets the key pair for SAML assertions.
+	SetEncryptionKeyPair(k *EncryptionKeyPair)
 }
 
 // NewSAMLConnector returns a new SAMLConnector based off a name and SAMLConnectorSpecV2.
@@ -379,6 +383,16 @@ func (o *SAMLConnectorV2) SetSigningKeyPair(k *SigningKeyPair) {
 	o.Spec.SigningKeyPair = k
 }
 
+// GetEncryptionKeyPair returns the key pair for SAML assertions.
+func (o *SAMLConnectorV2) GetEncryptionKeyPair() *EncryptionKeyPair {
+	return o.Spec.EncryptionKeyPair
+}
+
+// SetEncryptionKeyPair sets the key pair for SAML assertions.
+func (o *SAMLConnectorV2) SetEncryptionKeyPair(k *EncryptionKeyPair) {
+	o.Spec.EncryptionKeyPair = k
+}
+
 // CheckAndSetDefaults checks and sets default values
 func (o *SAMLConnectorV2) CheckAndSetDefaults() error {
 	if err := o.Metadata.CheckAndSetDefaults(); err != nil {
@@ -439,6 +453,8 @@ type SAMLConnectorSpecV2 struct {
 	SigningKeyPair *SigningKeyPair `json:"signing_key_pair,omitempty"`
 	// Provider is the external identity provider.
 	Provider string `json:"provider,omitempty"`
+	// EncryptionKeyPair is a key pair used for decryption of SAML assertions.
+	EncryptionKeyPair *EncryptionKeyPair `json:"assertion_key_pair,omitempty"`
 }
 
 // AttributeMapping is SAML Attribute statement mapping
@@ -454,6 +470,14 @@ type AttributeMapping struct {
 
 // SigningKeyPair is a key pair used to sign SAML AuthnRequest
 type SigningKeyPair struct {
+	// PrivateKey is PEM encoded x509 private key
+	PrivateKey string `json:"private_key"`
+	// Cert is certificate in OpenSSH authorized keys format
+	Cert string `json:"cert"`
+}
+
+// EncryptionKeyPair is a key pair used for decryption SAML assertions.
+type EncryptionKeyPair struct {
 	// PrivateKey is PEM encoded x509 private key
 	PrivateKey string `json:"private_key"`
 	// Cert is certificate in OpenSSH authorized keys format
