@@ -341,6 +341,22 @@ func (k *Key) SSHCert() (*ssh.Certificate, error) {
 	return cert, nil
 }
 
+// ActiveRequests gets the active requests associated with this key.
+func (k *Key) ActiveRequests() (services.RequestIDs, error) {
+	var activeRequests services.RequestIDs
+	sshCert, err := k.SSHCert()
+	if err != nil {
+		return activeRequests, trace.Wrap(err)
+	}
+	rawRequests, ok := sshCert.Extensions[teleport.CertExtensionTeleportActiveRequests]
+	if ok {
+		if err := activeRequests.Unmarshal([]byte(rawRequests)); err != nil {
+			return activeRequests, trace.Wrap(err)
+		}
+	}
+	return activeRequests, nil
+}
+
 // CheckCert makes sure the SSH certificate is valid.
 func (k *Key) CheckCert() error {
 	cert, err := k.SSHCert()

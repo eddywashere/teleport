@@ -19,11 +19,561 @@ package services
 import (
 	"testing"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/gravitational/trace"
+
+	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// mockUserAndRoleGetter mocks the UserAndRoleGetter interface.
+type mockUserAndRoleGetter struct {
+	users map[string]types.User
+	roles map[string]types.Role
+}
+
+// user inserts a new user with the specified roles and returns the username.
+func (m *mockUserAndRoleGetter) user(t *testing.T, roles ...string) string {
+	name := uuid.New()
+	user, err := types.NewUser(name)
+	require.NoError(t, err)
+
+	user.SetRoles(roles)
+	m.users[name] = user
+	return name
+}
+
+func (m *mockUserAndRoleGetter) GetUser(name string, withSecrets bool) (types.User, error) {
+	if withSecrets {
+		return nil, trace.NotImplemented("mock getter does not store secrets")
+	}
+	user, ok := m.users[name]
+	if !ok {
+		return nil, trace.NotFound("no such user: %q", name)
+	}
+	return user, nil
+}
+
+func (m *mockUserAndRoleGetter) GetRole(name string) (types.Role, error) {
+	role, ok := m.roles[name]
+	if !ok {
+		return nil, trace.NotFound("no such role: %q", name)
+	}
+	return role, nil
+}
+
+func (m *mockUserAndRoleGetter) GetRoles() ([]types.Role, error) {
+	roles := make([]types.Role, 0, len(m.roles))
+	for _, r := range m.roles {
+		roles = append(roles, r)
+	}
+	return roles, nil
+}
+
+// TestReviewThresholds tests various review threshold scenarios
+func TestReviewThresholds(t *testing.T) {
+	// describes a collection of roles with various approval/review
+	// permissions.
+	roleDesc := map[string]types.RoleConditions{
+		// dictator is the role that will be requested
+		"dictator": {
+			// ...
+		},
+		// populists can achieve dictatorship via uprising or consensus, but only
+		// be conclusively denied via uprising.
+		"populist": {
+			Request: &types.AccessRequestConditions{
+				Roles: []string{"dictator"},
+				Annotations: map[string][]string{
+					"mechanism": {"uprising", "consensus"},
+				},
+				Thresholds: []types.AccessReviewThreshold{
+					{
+						Name:    "overwhelming consensus",
+						Approve: 3,
+					},
+					{
+						Name:    "popular uprising",
+						Filter:  `contains(reviewer.roles,"proletariat")`,
+						Approve: 2,
+						Deny:    2,
+					},
+				},
+			},
+		},
+		// generals can achieve dictatorship via coup or consensus, but only
+		// be conclusively denied via coup.
+		"general": {
+			Request: &types.AccessRequestConditions{
+				Roles: []string{"dictator"},
+				Annotations: map[string][]string{
+					"mechanism": {"coup", "consensus"},
+				},
+				Thresholds: []types.AccessReviewThreshold{
+					{
+						Name:    "overwhelming consensus",
+						Approve: 3,
+					},
+					{
+						Name:    "bloodless coup",
+						Filter:  `contains(reviewer.roles,"military")`,
+						Approve: 2,
+						Deny:    2,
+					},
+				},
+			},
+		},
+		// conquerors can a achieve, or be conclusively denied, dictatorship
+		// via treachery.
+		"conqueror": {
+			Request: &types.AccessRequestConditions{
+				Roles: []string{"dictator"},
+				Annotations: map[string][]string{
+					"mechanism": {"treachery"},
+				},
+				// no explicit thresholds defaults to single approval/denial
+			},
+		},
+		// the proletariat can put dictators into power via uprising
+		"proletariat": {
+			ReviewRequests: &types.AccessReviewConditions{
+				Roles: []string{"dictator"},
+				Where: `contains(request.system_annotations["mechanisms"],"uprising")`,
+			},
+		},
+		// the intelligentsia can put dictators into power via consensus
+		"intelligentsia": {
+			ReviewRequests: &types.AccessReviewConditions{
+				Roles: []string{"dictator"},
+				Where: `contains(request.system_annotations["mechanism"],"consensus")`,
+			},
+		},
+		// the military can put dictators into power via a coup our treachery
+		"military": {
+			ReviewRequests: &types.AccessReviewConditions{
+				Roles: []string{"dictator"},
+				Where: `contains(request.system_annotations["mechanisms"],"coup") || contains(request.system_annotations["mechanism"],"treachery")`,
+			},
+		},
+	}
+
+	roles := make(map[string]types.Role)
+
+	for name, conditions := range roleDesc {
+		role, err := types.NewRole(name, types.RoleSpecV3{
+			Allow: conditions,
+		})
+		require.NoError(t, err)
+
+		roles[name] = role
+	}
+
+	// describes a collection of users with various roles
+	userDesc := map[string][]string{
+		"alice": {"populist", "proletariat", "intelligentsia", "military"},
+		"bob":   {"general", "proletariat", "intelligentsia", "military"},
+		"carol": {"conqueror", "proletariat", "intelligentsia", "military"},
+		"dave":  {"populist", "general", "conqueror"},
+	}
+
+	users := make(map[string]types.User)
+
+	for name, roles := range userDesc {
+		user, err := types.NewUser(name)
+		require.NoError(t, err)
+
+		user.SetRoles(roles)
+		users[name] = user
+	}
+
+	g := &mockUserAndRoleGetter{
+		roles: roles,
+		users: users,
+	}
+
+	const (
+		approve = types.RequestState_APPROVED
+		deny    = types.RequestState_DENIED
+	)
+
+	tts := []struct {
+		// requestor is the name of the requesting user
+		requestor string
+		reviews   []struct {
+			// author is the name of the review author
+			author string
+			// noReview indicates that author will not be allowed to review
+			noReview bool
+			// propose is the state proposed by the review
+			propose types.RequestState
+			// expect is the expected post-review state of the request (defaults to pending)
+			expect types.RequestState
+		}
+	}{
+		{
+			requestor: "alice", // permitted by role populist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // cannot review own requests
+					author:   "alice",
+					noReview: true,
+				},
+				{ // no matching allow directives
+					author:   g.user(t, "military"),
+					noReview: true,
+				},
+				{ // adds one approval to all thresholds
+					author:  g.user(t, "proletariat", "intelligentsia", "military"),
+					propose: approve,
+				},
+				{ // adds one denial to all thresholds
+					author:  g.user(t, "proletariat", "intelligentsia", "military"),
+					propose: deny,
+				},
+				{ // adds second approval to all thresholds, triggers "uprising".
+					author:  g.user(t, "proletariat", "intelligentsia", "military"),
+					propose: approve,
+					expect:  approve,
+				},
+				{ // adds second denial to all thresholds, no effect since a state-transition was already triggered.
+					author:  g.user(t, "proletariat", "intelligentsia", "military"),
+					propose: deny,
+					expect:  approve,
+				},
+			},
+		},
+		{
+			requestor: "alice", // permitted by role populist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // matches "consensus" threshold
+					author:  g.user(t, "intelligentsia"),
+					propose: approve,
+				},
+				{ // matches "uprising" and "consensus" thresholds
+					author:  g.user(t, "proletariat"),
+					propose: approve,
+				},
+				{ // 1 of 2 required denials (does not triger threshold)
+					author:  g.user(t, "proletariat"),
+					propose: deny,
+				},
+				{ // review is permitted but has no effect since "consensus" has no denail condition
+					author:  g.user(t, "intelligentsia"),
+					propose: deny,
+				},
+				{ // tirggers the "consensus" approval threshold
+					author:  g.user(t, "intelligentsia"),
+					propose: approve,
+					expect:  approve,
+				},
+			},
+		},
+		{
+			requestor: "bob", // permitted by role general
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // cannot review own requests
+					author:   "bob",
+					noReview: true,
+				},
+				{ // matches "consensus" threshold
+					author:  g.user(t, "intelligentsia"),
+					propose: approve,
+				},
+				{ // matches "coup" threshold
+					author:  g.user(t, "military"),
+					propose: approve,
+				},
+				{ // no matching allow directives
+					author:   g.user(t, "proletariat"),
+					noReview: true,
+				},
+				{ // 1 of 2 required denials for "coup" (does not triger threshold)
+					author:  g.user(t, "military"),
+					propose: deny,
+				},
+				{ // review is permitted but matches no thresholds
+					author:  g.user(t, "intelligentsia"),
+					propose: deny,
+				},
+				{ // tirggers the "coup" denial threshold
+					author:  g.user(t, "military"),
+					propose: deny,
+					expect:  deny,
+				},
+			},
+		},
+		{
+			requestor: "carol", // permitted by role conqueror
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // cannot review own requests
+					author:   "carol",
+					noReview: true,
+				},
+				{ // no matching allow directives
+					author:   g.user(t, "proletariat"),
+					noReview: true,
+				},
+				{ // no matching allow directives
+					author:   g.user(t, "intelligentsia"),
+					noReview: true,
+				},
+				{ // triggers "default" threshold for immediate approval
+					author:  g.user(t, "military"),
+					propose: approve,
+					expect:  approve,
+				},
+			},
+		},
+		{
+			requestor: "carol", // permitted by role conqueror
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // triggers "default" threshold for immediate denial
+					author:  g.user(t, "military"),
+					propose: deny,
+					expect:  deny,
+				},
+			},
+		},
+		{
+			// this test case covers a scenario where multiple roles contributed
+			// to requestor's permissions.  Current behavior is to require one threshold
+			// to pass from each contributing role, but future iterations may become
+			// "smart" about which thresholds really need to pass.
+			requestor: "dave", // permitted by conqueror, general, *and* populist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // matches "default", "coup", and "consensus" thresholds
+					author:  g.user(t, "military"),
+					propose: approve,
+				},
+
+				{ // matches "default", "uprising", and "consensus" thresholds
+					author:  g.user(t, "proletariat"),
+					propose: approve,
+				},
+				{ // matches "default" and "consensus" thresholds.
+					author:  g.user(t, "intelligentsia"),
+					propose: approve,
+					expect:  approve,
+				},
+			},
+		},
+		{
+			// this test case covers a scenario where multiple roles contributed
+			// to requestor's permissions.  since the reviewing users hold multiple
+			// roles which match various threshold filters, we reach approval with
+			// the minimum number reviews necessary s.t. one threshold passes from each
+			// requestor role.
+			requestor: "dave", // permitted by conqueror, general, *and* populist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // matches all thresholds
+					author:  g.user(t, "military", "proletariat"),
+					propose: approve,
+				},
+
+				{ // matches all thresholds
+					author:  g.user(t, "military", "proletariat"),
+					propose: approve,
+					expect:  approve,
+				},
+			},
+		},
+		{
+			// this test case covers a scenario where multiple roles contributed
+			// to requestor's permissions.  the interaction here is a bit unintuitive.
+			// review *submission* is allowed because of the system annotations applied
+			// by "general"/"populist", *but* we end up triggering a threshold which originates
+			// from "conqueror".  this may be unexpected behavior for some people since it
+			// effectively allows a third role to open up the ability for the reviewer to
+			// trigger a threshold which they would not otherwise be able to trigger.  while
+			// unintuitive, this effect only manifests as teleport being overly-eager
+			// about denying requests (i.e. erring on the side of caution).
+			requestor: "dave", // permitted by conqueror, general, *and* populist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // ...
+					author:  g.user(t, "intelligentsia"),
+					propose: deny,
+					expect:  deny,
+				},
+			},
+		},
+	}
+
+	for ti, tt := range tts {
+
+		// create a request for the specified author
+		req, err := types.NewAccessRequest("some-id", tt.requestor, "dictator")
+		require.NoError(t, err, "req=%d", ti)
+
+		// perform request validation (necessary in order to initialize internal
+		// request variables like annotations and thresholds).
+		validator, err := NewRequestValidator(g, tt.requestor, ExpandVars(true))
+		require.NoError(t, err, "req=%d", ti)
+
+		require.NoError(t, validator.Validate(req), "req=%d", ti)
+
+	Inner:
+		for ri, rt := range tt.reviews {
+			if rt.expect.IsNone() {
+				rt.expect = types.RequestState_PENDING
+			}
+
+			checker, err := NewReviewPermissionChecker(g, rt.author)
+			require.NoError(t, err, "req=%d, rev=%d", ti, ri)
+
+			canReview, err := checker.CanReviewRequest(req)
+			require.NoError(t, err, "req=%d, rev=%d", ti, ri)
+
+			if rt.noReview {
+				require.False(t, canReview, "req=%d, rev=%d", ti, ri)
+				continue Inner
+			}
+
+			rev := types.AccessReview{
+				Author: rt.author,
+				State:  rt.propose,
+			}
+
+			author, ok := users[rt.author]
+			require.True(t, ok, "req=%d, rev=%d", ti, ri)
+
+			err = ApplyAccessReview(req, rev, author)
+			require.NoError(t, err, "req=%d, rev=%d", ti, ri)
+			require.Equal(t, rt.expect.String(), req.GetState().String(), "req=%d, rev=%d", ti, ri)
+		}
+	}
+}
+
+// TestThresholdReviewFilter verifies basic filter syntax.
+func TestThresholdReviewFilter(t *testing.T) {
+
+	// test cases consist of a context, and various filter expressions
+	// which should or should not match the supplied context.
+	tts := []struct {
+		ctx       thresholdFilterContext
+		willMatch []string
+		wontMatch []string
+		wontParse []string
+	}{
+		{ // test expected matching behavior against a basic example context
+			ctx: thresholdFilterContext{
+				Reviewer: reviewAuthorContext{
+					Roles: []string{"dev"},
+					Traits: map[string][]string{
+						"teams": []string{"staging-admin"},
+					},
+				},
+				Review: reviewParamsContext{
+					Reason: "ok",
+					Annotations: map[string][]string{
+						"constraints": []string{"no-admin"},
+					},
+				},
+				Request: reviewRequestContext{
+					Roles:  []string{"dev"},
+					Reason: "plz",
+					SystemAnnotations: map[string][]string{
+						"teams": []string{"staging-dev"},
+					},
+				},
+			},
+			willMatch: []string{
+				`contains(reviewer.roles,"dev")`,
+				`contains(reviewer.traits["teams"],"staging-admin") && contains(request.system_annotations["teams"],"staging-dev")`,
+				`!contains(review.annotations["constraints"],"no-admin") || !contains(request.roles,"admin")`,
+				`equals(request.reason,"plz") && equals(review.reason,"ok")`,
+				`contains(reviewer.roles,"admin") || contains(reviewer.roles,"dev")`,
+				`!(contains(reviewer.roles,"foo") || contains(reviewer.roles,"bar"))`,
+			},
+			wontMatch: []string{
+				`contains(reviewer.roles, "admin")`,
+				`equals(request.reason,review.reason)`,
+				`!contains(reviewer.traits["teams"],"staging-admin")`,
+				`contains(reviewer.roles,"admin") && contains(reviewer.roles,"dev")`,
+			},
+		},
+		{ // test expected matching behavior against zero values
+			willMatch: []string{
+				`equals(request.reason,review.reason)`,
+				`!contains(reviewer.traits["teams"],"staging-admin")`,
+				`!contains(review.annotations["constraints"],"no-admin") || !contains(request.roles,"admin")`,
+				`!(contains(reviewer.roles,"foo") || contains(reviewer.roles,"bar"))`,
+			},
+			wontMatch: []string{
+				`contains(reviewer.roles, "admin")`,
+				`contains(reviewer.roles,"admin") && contains(reviewer.roles,"dev")`,
+				`contains(reviewer.roles,"dev")`,
+				`contains(reviewer.traits["teams"],"staging-admin") && contains(request.system_annotations["teams"],"staging-dev")`,
+				`equals(request.reason,"plz") && equals(review.reason,"ok")`,
+				`contains(reviewer.roles,"admin") || contains(reviewer.roles,"dev")`,
+			},
+			// confirm that an empty context can be used to catch syntax errors
+			wontParse: []string{
+				`equals(fully.fake.path,"should-fail")`,
+				`fakefunc(reviewer.roles,"some-role")`,
+				`equals("too","many","params")`,
+				`contains("missing-param")`,
+				`contains(reviewer.partially.fake.path,"also fails")`,
+				`!`,
+				`&& missing-left`,
+			},
+		},
+	}
+
+	for _, tt := range tts {
+		parser, err := NewJSONBoolParser(tt.ctx)
+		require.NoError(t, err)
+		for _, expr := range tt.willMatch {
+			result, err := parser.EvalBoolPredicate(expr)
+			require.NoError(t, err)
+			require.True(t, result)
+		}
+
+		for _, expr := range tt.wontMatch {
+			result, err := parser.EvalBoolPredicate(expr)
+			require.NoError(t, err)
+			require.False(t, result)
+		}
+
+		for _, expr := range tt.wontParse {
+			_, err := parser.EvalBoolPredicate(expr)
+			require.Error(t, err)
+		}
+	}
+}
 
 // TestAccessRequestMarshaling verifies that marshaling/unmarshaling access requests
 // works as expected (failures likely indicate a problem with json schema).

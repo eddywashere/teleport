@@ -96,11 +96,17 @@ func (c *kubeCredentialsCommand) run(cf *CLIConf) error {
 		// a new one.
 	}
 
+	activeRequests, err := k.ActiveRequests()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
 	log.Debugf("Requesting TLS cert for kubernetes cluster %q", c.kubeCluster)
 	err = client.RetryWithRelogin(cf.Context, tc, func() error {
 		return tc.ReissueUserCerts(cf.Context, client.ReissueParams{
 			RouteToCluster:    c.teleportCluster,
 			KubernetesCluster: c.kubeCluster,
+			AccessRequests:    activeRequests.AccessRequests,
 		})
 	})
 	if err != nil {
