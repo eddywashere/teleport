@@ -272,18 +272,28 @@ docs-test-links:
 	done
 
 #
-# Runs all tests except integration, called by CI/CD.
-#
-# Chaos tests have high concurrency, run without race detector and have TestChaos prefix.
+# Runs all Go/shell tests, called by CI/CD.
 #
 .PHONY: test
-test: ensure-webassets
-test: FLAGS ?= '-race'
-test: PACKAGES := $(shell go list ./... | grep -v integration)
-test: CHAOS_FOLDERS := $(shell find . -type f -name '*chaos*.go' -not -path '*/vendor/*' | xargs dirname | uniq)
-test: $(VERSRC)
+test: test-sh test-go
+
+#
+# Runs all Go tests except integration, called by CI/CD.
+# Chaos tests have high concurrency, run without race detector and have TestChaos prefix.
+#
+.PHONY: test-go
+test-go: ensure-webassets
+test-go: FLAGS ?= '-race'
+test-go: PACKAGES := $(shell go list ./... | grep -v integration)
+test-go: CHAOS_FOLDERS := $(shell find . -type f -name '*chaos*.go' -not -path '*/vendor/*' | xargs dirname | uniq)
+test-go: $(VERSRC)
 	go test -tags "$(PAM_TAG) $(FIPS_TAG) $(BPF_TAG)" $(PACKAGES) $(FLAGS) $(ADDFLAGS)
 	go test -tags "$(PAM_TAG) $(FIPS_TAG) $(BPF_TAG)" -test.run=TestChaos $(CHAOS_FOLDERS) -cover
+
+# Find and run all shell script unit tests (using https://github.com/bats-core/bats-core)
+.PHONY: test-sh
+test-sh:
+	cd assets/aws/files/tests && bats --version && bats -p .
 
 #
 # Integration tests. Need a TTY to work.
@@ -347,6 +357,7 @@ lint-sh:
 		--exclude=SC1091 \
 		--exclude=SC2129 \
 		$(SH_LINT_FLAGS)
+
 
 # Lints all the Helm charts found in directories under examples/chart and exits on failure
 # If there is a .lint directory inside, the chart gets linted once for each .yaml file in that directory
