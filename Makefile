@@ -358,7 +358,6 @@ lint-sh:
 		--exclude=SC2129 \
 		$(SH_LINT_FLAGS)
 
-
 # Lints all the Helm charts found in directories under examples/chart and exits on failure
 # If there is a .lint directory inside, the chart gets linted once for each .yaml file in that directory
 .PHONY: lint-helm
