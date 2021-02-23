@@ -293,7 +293,7 @@ test-go: $(VERSRC)
 # Find and run all shell script unit tests (using https://github.com/bats-core/bats-core)
 .PHONY: test-sh
 test-sh:
-	cd assets/aws/files/tests && bats --version && bats -p .
+	@find . -iname "*.bats" -exec dirname {} \; | uniq | xargs -t -L1 bats -p
 
 #
 # Integration tests. Need a TTY to work.
