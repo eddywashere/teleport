@@ -137,6 +137,19 @@ func TestReviewThresholds(t *testing.T) {
 				// no explicit thresholds defaults to single approval/denial
 			},
 		},
+		// idealists have an directive for requesting a role which
+		// does not exist, and no threshold which permit it to be assumed.
+		"idealist": {
+			Request: &types.AccessRequestConditions{
+				Roles: []string{"never"},
+				Thresholds: []types.AccessReviewThreshold{
+					{
+						Name: "reality check",
+						Deny: 1,
+					},
+				},
+			},
+		},
 		// the proletariat can put dictators into power via uprising
 		"proletariat": {
 			ReviewRequests: &types.AccessReviewConditions{
@@ -177,6 +190,7 @@ func TestReviewThresholds(t *testing.T) {
 		"bob":   {"general", "proletariat", "intelligentsia", "military"},
 		"carol": {"conqueror", "proletariat", "intelligentsia", "military"},
 		"dave":  {"populist", "general", "conqueror"},
+		"erika": {"populist", "idealist"},
 	}
 
 	users := make(map[string]types.User)
@@ -202,7 +216,9 @@ func TestReviewThresholds(t *testing.T) {
 	tts := []struct {
 		// requestor is the name of the requesting user
 		requestor string
-		reviews   []struct {
+		// the roles to be requrested (defaults to "dictator")
+		roles   []string
+		reviews []struct {
 			// author is the name of the review author
 			author string
 			// noReview indicates that author will not be allowed to review
@@ -430,12 +446,64 @@ func TestReviewThresholds(t *testing.T) {
 				},
 			},
 		},
+		{
+			// this test case is just a sanity-check to make sure that the next
+			// case is testing what we think its testing (that thresholds associated
+			// with unrequested roles are not added to the request).
+			requestor: "erika", // permitted by combination of populist and idealist
+			roles:     []string{"dictator", "never"},
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // matches default threshold from idealist
+					author:  g.user(t, "intelligentsia"),
+					propose: deny,
+					expect:  deny,
+				},
+			},
+		},
+		{
+			// this test case verifies that thresholds associated with unrelated roles
+			// are not added to an access request.  erika holds a role with the default
+			// threshold (idealist) but she is only requesting dictator (which does not
+			// match any of the allow directives on idealist) so that threshold should
+			// be omitted.
+			requestor: "erika", // permitted by populist, but also holds idealist
+			reviews: []struct {
+				author          string
+				noReview        bool
+				propose, expect types.RequestState
+			}{
+				{ // review is permitted but matches no thresholds
+					author:  g.user(t, "intelligentsia"),
+					propose: deny,
+				},
+				{ // matches "consensus" threshold
+					author:  g.user(t, "intelligentsia"),
+					propose: approve,
+				},
+				{ // matches "consensus" and "uprising" thresholds
+					author:  g.user(t, "proletariat"),
+					propose: deny,
+				},
+				{ // matches "consensus" threshold
+					author:  g.user(t, "proletariat"),
+					propose: approve,
+				},
+			},
+		},
 	}
 
 	for ti, tt := range tts {
 
+		if len(tt.roles) == 0 {
+			tt.roles = []string{"dictator"}
+		}
+
 		// create a request for the specified author
-		req, err := types.NewAccessRequest("some-id", tt.requestor, "dictator")
+		req, err := types.NewAccessRequest("some-id", tt.requestor, tt.roles...)
 		require.NoError(t, err, "req=%d", ti)
 
 		// perform request validation (necessary in order to initialize internal

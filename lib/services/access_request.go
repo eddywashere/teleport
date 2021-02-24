@@ -551,8 +551,10 @@ type RequestValidator struct {
 	Annotations struct {
 		Allow, Deny map[string][]string
 	}
-	Thresholds         []types.AccessReviewThreshold
-	ThresholdSets      []types.ThresholdIndexSet
+	ThresholdMatchers []struct {
+		Matchers   []parse.Matcher
+		Thresholds []types.AccessReviewThreshold
+	}
 	SuggestedReviewers []string
 }
 
@@ -640,17 +642,23 @@ func (m *RequestValidator) Validate(req AccessRequest) error {
 	}
 
 	if m.opts.expandVars {
-		// build the role-threshold mapping.  we currently just use the same
-		// group of index sets for each requested role, but future versions
-		// will build custom index set groups for each role based on which
-		// statically assigned roles permit it.
+		// build the thresholds array and role-threshold-mapping.  the rtm encodes the
+		// relationship between a role, and the thresholds which must pass in order
+		// for that role to be considered approved.  when building the validator we
+		// recorded the relationship between the various allow matchers and their associated
+		// threshold groups.
 		rtm := make(map[string]types.ThresholdIndexSets)
+		var tc thresholdCollector
 		for _, role := range req.GetRoles() {
+			sets, err := m.collectSetsForRole(&tc, role)
+			if err != nil {
+				return trace.Wrap(err)
+			}
 			rtm[role] = types.ThresholdIndexSets{
-				Sets: m.ThresholdSets,
+				Sets: sets,
 			}
 		}
-		req.SetThresholds(m.Thresholds)
+		req.SetThresholds(tc.Thresholds)
 		req.SetRoleThresholdMapping(rtm)
 
 		// incoming requests must have system annotations attached
@@ -702,40 +710,27 @@ func (m *RequestValidator) push(role Role) error {
 		return trace.Wrap(err)
 	}
 
+	// record what will be the starting index of the allow
+	// matchers for this role, if it applies any.
+	astart := len(m.Roles.Allow)
+
 	m.Roles.Allow, err = appendRoleMatchers(m.Roles.Allow, allow.Roles, allow.ClaimsToRoles, m.user.GetTraits())
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	if m.opts.expandVars {
-		// store approval thresholds and build an associated index set. each index set
-		// must have one of its approval conditions met.  since we are adding an index
-		// set for each statically assigned role, we are effectively stating that one
-		// threshold from each statically assigned role must be met. future version of
-		// teleport will be "smarter" with how they construct index sets, allowing us to
-		// remove redundant requirements in a backwards-compatible way.
-		if !allow.IsZero() {
-			thresholds := allow.Thresholds
-			if len(thresholds) == 0 {
-				// allow directives exist but no thesholds were specified.  insert the
-				// default theshold value.
-				thresholds = []types.AccessReviewThreshold{
-					{
-						Name:    "default",
-						Approve: 1,
-						Deny:    1,
-					},
-				}
-			}
-			var tset types.ThresholdIndexSet
-			for _, t := range thresholds {
-				tid, err := m.pushThreshold(t)
-				if err != nil {
-					return trace.Wrap(err)
-				}
-				tset.Indexes = append(tset.Indexes, tid)
-			}
-			m.ThresholdSets = append(m.ThresholdSets, tset)
+		// if this role added additional allow matchers, then we need to record the relationship
+		// between its matchers and its thresholds.  this information is used later to calculate
+		// the rtm and threshold list.
+		if len(m.Roles.Allow) > astart {
+			m.ThresholdMatchers = append(m.ThresholdMatchers, struct {
+				Matchers   []parse.Matcher
+				Thresholds []types.AccessReviewThreshold
+			}{
+				Matchers:   m.Roles.Allow[astart:],
+				Thresholds: allow.Thresholds,
+			})
 		}
 
 		// validation process for incoming access requests requires
@@ -749,9 +744,44 @@ func (m *RequestValidator) push(role Role) error {
 	return nil
 }
 
+// thresholdCollector is a helper which assembles the Thresholds array for a request.
+// the push() method is used to insert groups of related thresholds and calculate their
+// corresponding index set.
+type thresholdCollector struct {
+	Thresholds []types.AccessReviewThreshold
+}
+
+// push pushes a set of related thresholds and returns the associated indexes.  each set of indexes represents
+// an "or" operator, indicating that one of the referenced thresholds must reach its approval condition in order
+// for the set as a whole to be considered approved.
+func (c *thresholdCollector) push(s []types.AccessReviewThreshold) ([]uint32, error) {
+	if len(s) == 0 {
+		// empty threshold sets are equivalent to the default threshold
+		s = []types.AccessReviewThreshold{
+			{
+				Name:    "default",
+				Approve: 1,
+				Deny:    1,
+			},
+		}
+	}
+
+	var indexes []uint32
+
+	for _, t := range s {
+		tid, err := c.pushThreshold(t)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		indexes = append(indexes, tid)
+	}
+
+	return indexes, nil
+}
+
 // pushThreshold pushes a threshold to the main threshold list and returns its index
 // as a uint32 for compatibility with grpc types.
-func (m *RequestValidator) pushThreshold(t types.AccessReviewThreshold) (uint32, error) {
+func (c *thresholdCollector) pushThreshold(t types.AccessReviewThreshold) (uint32, error) {
 	// maxThresholds is an arbitrary large number that serves as a guard against
 	// odd errors due to casting between int and uint32.  This is probably unnecessary
 	// since we'd likely hit other limitations *well* before wrapping became a concern,
@@ -759,19 +789,19 @@ func (m *RequestValidator) pushThreshold(t types.AccessReviewThreshold) (uint32,
 	const maxThresholds = 4096
 
 	// don't bother double-storing equivalent thresholds
-	for i, threshold := range m.Thresholds {
+	for i, threshold := range c.Thresholds {
 		if t.Equals(threshold) {
 			return uint32(i), nil
 		}
 	}
 
-	if len(m.Thresholds) >= maxThresholds {
+	if len(c.Thresholds) >= maxThresholds {
 		return 0, trace.LimitExceeded("max review thresholds exceeded (max=%d)", maxThresholds)
 	}
 
-	m.Thresholds = append(m.Thresholds, t)
+	c.Thresholds = append(c.Thresholds, t)
 
-	return uint32(len(m.Thresholds) - 1), nil
+	return uint32(len(c.Thresholds) - 1), nil
 }
 
 // CanRequestRole checks if a given role can be requested.
@@ -787,6 +817,37 @@ func (m *RequestValidator) CanRequestRole(name string) bool {
 		}
 	}
 	return false
+}
+
+// collectSetsForRole collects the threshold index sets which describe the various groups of
+// thresholds which must pass in order for a request for the given role to be approved.
+func (m *RequestValidator) collectSetsForRole(c *thresholdCollector, role string) ([]types.ThresholdIndexSet, error) {
+	var sets []types.ThresholdIndexSet
+
+Outer:
+	for _, tms := range m.ThresholdMatchers {
+		for _, matcher := range tms.Matchers {
+			if matcher.Match(role) {
+				set, err := c.push(tms.Thresholds)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				sets = append(sets, types.ThresholdIndexSet{
+					Indexes: set,
+				})
+				continue Outer
+			}
+		}
+	}
+
+	if len(sets) == 0 {
+		// this should never happen since every allow directive is associated with at least one
+		// threshold, and this operation happens after requested roles have been validated to match at
+		// least one allow directive.
+		return nil, trace.BadParameter("role %q matches no threshold sets (this is a bug)", role)
+	}
+
+	return sets, nil
 }
 
 // SystemAnnotations calculates the system annotations for a pending
